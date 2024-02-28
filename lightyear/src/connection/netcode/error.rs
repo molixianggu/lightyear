@@ -24,3 +24,20 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
+
+#[derive(Debug)]
+pub struct DisConnectionError {
+    pub addr: SocketAddr,
+}
+
+impl fmt::Display for DisConnectionError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Error with socket address: {:?}", self.addr)
+    }
+}
+
+impl Into<Box<dyn Error + Send + Sync>> for DisConnectionError {
+    fn into(self) -> Box<dyn Error + Send + Sync> {
+        Box::new(self)
+    }
+}

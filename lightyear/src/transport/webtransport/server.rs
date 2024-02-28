@@ -19,6 +19,8 @@ use wtransport::{Connection, Endpoint};
 use crate::transport::webtransport::MTU;
 use crate::transport::{PacketReceiver, PacketSender, Transport};
 
+use super::super::super::connection::netcode::DisConnectionError;
+
 /// WebTransport client socket
 pub struct WebTransportServerSocket {
     server_addr: SocketAddr,
@@ -74,7 +76,8 @@ impl WebTransportServerSocket {
 
         // connection established, waiting for data from client
         let connection_recv = connection.clone();
-        let from_client_handle = IoTaskPool::get().spawn(async move {
+        let client_sender = from_client_sender.clone();
+        let from_client_handle = IoTaskPool::get().spawn(Compat::new(async move {
             loop {
                 // receive messages from client
                 match connection_recv.receive_datagram().await {
@@ -84,19 +87,21 @@ impl WebTransportServerSocket {
                             data.as_ref(),
                             data.len()
                         );
-                        from_client_sender.send((MessageDatagram::Datagram(data), client_addr)).unwrap();
+                        client_sender
+                            .send((MessageDatagram::Datagram(data), client_addr))
+                            .unwrap();
                     }
                     Err(e) => {
                         error!("receive_datagram connection error: {:?}", e);
                         // to_client_channels.lock().unwrap().remove(&client_addr);
-                        from_client_sender.send((MessageDatagram::Close, client_addr)).unwrap();
-                        break;
+                        // from_client_sender.send((MessageDatagram::Close, client_addr)).unwrap();
+                        // break;
                     }
                 }
             }
-        });
+        }));
         let connection_send = connection.clone();
-        let to_client_handle = IoTaskPool::get().spawn(async move {
+        let to_client_handle = IoTaskPool::get().spawn(Compat::new(async move {
             loop {
                 if let Some(msg) = to_client_receiver.recv().await {
                     trace!("sending datagram to client!: {:?}", &msg);
@@ -107,10 +112,15 @@ impl WebTransportServerSocket {
                         });
                 }
             }
-        });
+        }));
 
         // await for the quic connection to be closed for any reason
         connection.closed().await;
+
+        from_client_sender
+            .send((MessageDatagram::Close, client_addr))
+            .unwrap();
+        connection.remote_address();
         info!("Connection with {} closed", client_addr);
         to_client_channels.lock().unwrap().remove(&client_addr);
         debug!("Dropping tasks");
@@ -205,17 +215,16 @@ struct WebTransportServerSocketReceiver {
 impl PacketReceiver for WebTransportServerSocketReceiver {
     fn recv(&mut self) -> std::io::Result<Option<(&mut [u8], SocketAddr)>> {
         match self.from_client_receiver.try_recv() {
-            Ok((datagram, addr)) => {
-                match datagram {
-                    MessageDatagram::Datagram(data) => {
-                        self.buffer[..data.len()].copy_from_slice(data.payload().as_ref());
-                        Ok(Some((&mut self.buffer[..data.len()], addr)))
-                    }
-                    MessageDatagram::Close => {
-                        Err(std::io::Error::new(std::io::ErrorKind::TimedOut, addr.to_string()))
-                    }
+            Ok((datagram, addr)) => match datagram {
+                MessageDatagram::Datagram(data) => {
+                    self.buffer[..data.len()].copy_from_slice(data.payload().as_ref());
+                    Ok(Some((&mut self.buffer[..data.len()], addr)))
                 }
-            }
+                MessageDatagram::Close => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    DisConnectionError { addr },
+                )),
+            },
             Err(e) => {
                 if e == TryRecvError::Empty {
                     Ok(None)
